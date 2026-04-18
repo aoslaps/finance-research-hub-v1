@@ -135,9 +135,12 @@ def format_news_datetime(raw_publish_time: Any) -> str:
     if raw_publish_time is None:
         return "N/A"
 
-    timestamp = pd.to_datetime(raw_publish_time, unit="s", utc=True, errors="coerce")
-    if pd.isna(timestamp):
+    # pandas.to_datetime handles both unix seconds (int) and ISO strings.
+    if isinstance(raw_publish_time, (int, float)):
+        timestamp = pd.to_datetime(raw_publish_time, unit="s", utc=True, errors="coerce")
+    else:
         timestamp = pd.to_datetime(raw_publish_time, utc=True, errors="coerce")
+
     if pd.isna(timestamp):
         return "N/A"
 
@@ -176,18 +179,22 @@ def classify_macd(macd_value: Any, signal_value: Any) -> str:
 
 
 def compute_distance_from_ma_percent(price: Any, moving_average: Any) -> float | None:
-    """Compute distance from moving average as a percent of price."""
+    """Compute price distance from moving average as a percent of the MA.
+
+    Interpretation: result = +5.0 means price is 5% above the MA;
+    -5.0 means price is 5% below the MA.
+    """
     if price is None or moving_average is None:
         return None
     if pd.isna(price) or pd.isna(moving_average):
         return None
 
-    price_float = float(price)
-    if price_float == 0:
+    ma_float = float(moving_average)
+    if ma_float == 0:
         return None
 
-    # Formula is relative to current price, matching the requested display convention.
-    return ((price_float - float(moving_average)) / price_float) * 100
+    # Conventional finance formulation: relative to MA, not price.
+    return ((float(price) - ma_float) / ma_float) * 100
 
 
 def render_header(
@@ -234,27 +241,38 @@ def render_header(
         )
 
 
-def render_price_chart(history: pd.DataFrame) -> None:
-    """Render a candlestick chart with SMA 50 and SMA 200 overlays."""
-    hist = history.copy()
+def render_price_chart(history: pd.DataFrame, indicator_history: pd.DataFrame) -> None:
+    """Render a candlestick chart with SMA 50 and SMA 200 overlays.
+
+    Candlesticks come from `history` (user-selected range).
+    SMAs are computed on `indicator_history` (longer window) and then
+    clipped to the display range so the overlays render correctly even
+    on short periods.
+    """
+    # Compute SMAs on the longer window so rolling(50) and rolling(200)
+    # have enough data to produce non-NaN values.
+    sma_50 = indicator_history["Close"].rolling(50).mean()
+    sma_200 = indicator_history["Close"].rolling(200).mean()
+
+    # Clip to the visible candlestick window so overlay x-axis matches.
+    start_date = history.index[0] if not history.empty else None
+    if start_date is not None:
+        sma_50 = sma_50.loc[sma_50.index >= start_date]
+        sma_200 = sma_200.loc[sma_200.index >= start_date]
 
     fig = go.Figure(
         data=[
             go.Candlestick(
-                x=hist.index,
-                open=hist["Open"],
-                high=hist["High"],
-                low=hist["Low"],
-                close=hist["Close"],
+                x=history.index,
+                open=history["Open"],
+                high=history["High"],
+                low=history["Low"],
+                close=history["Close"],
             )
         ]
     )
-    fig.add_trace(
-        go.Scatter(x=hist.index, y=hist["Close"].rolling(50).mean(), name="SMA 50")
-    )
-    fig.add_trace(
-        go.Scatter(x=hist.index, y=hist["Close"].rolling(200).mean(), name="SMA 200")
-    )
+    fig.add_trace(go.Scatter(x=sma_50.index, y=sma_50.values, name="SMA 50"))
+    fig.add_trace(go.Scatter(x=sma_200.index, y=sma_200.values, name="SMA 200"))
     fig.update_layout(xaxis_rangeslider_visible=False)
 
     st.plotly_chart(fig, use_container_width=True)
@@ -270,11 +288,16 @@ def render_key_stats(info: dict[str, Any]) -> None:
         st.metric("P/E Ratio", format_number(info.get("trailingPE")))
         st.metric("Forward P/E", format_number(info.get("forwardPE")))
         st.metric("EPS (TTM)", format_number(info.get("trailingEps")))
-        dividend_yield = info.get("dividendYield")
-        if dividend_yield is not None and not pd.isna(dividend_yield):
-            st.metric("Dividend Yield", format_percent(float(dividend_yield) * 100))
-        else:
+        dividend_yield_raw = info.get("dividendYield")
+        if dividend_yield_raw is None or pd.isna(dividend_yield_raw):
             st.metric("Dividend Yield", "N/A")
+        else:
+            yield_value = float(dividend_yield_raw)
+            # Auto-detect unit: values above 1 are already in percent.
+            # Typical decimal-form yields are 0.001 to ~0.10. A value of 2.5
+            # is almost certainly 2.5%, not 250%.
+            yield_pct = yield_value if yield_value > 1 else yield_value * 100
+            st.metric("Dividend Yield", format_percent(yield_pct))
 
     with right_col:
         st.metric("52-Week High", format_currency(info.get("fiftyTwoWeekHigh")))
@@ -321,10 +344,24 @@ def render_news(news_items: list[dict[str, Any]]) -> None:
 
     recent_items = news_items[:5]
     for item in recent_items:
-        title = item.get("title") or "Untitled"
-        link = item.get("link") or ""
-        publisher = item.get("publisher") or "Unknown Source"
-        published_text = format_news_datetime(item.get("providerPublishTime"))
+        # Support both new (>=0.2.40) nested shape and old flat shape.
+        content = item.get("content") or item
+        title = content.get("title") or "Untitled"
+
+        canonical = content.get("canonicalUrl") or {}
+        link = canonical.get("url") if isinstance(canonical, dict) else ""
+        if not link:
+            link = content.get("link") or ""
+
+        provider = content.get("provider") or {}
+        publisher = (
+            provider.get("displayName")
+            if isinstance(provider, dict)
+            else None
+        ) or content.get("publisher") or "Unknown Source"
+
+        published_raw = content.get("pubDate") or content.get("providerPublishTime")
+        published_text = format_news_datetime(published_raw)
 
         headline_col, source_col, date_col = st.columns([6, 2, 2])
         with headline_col:
@@ -379,7 +416,7 @@ def run_app() -> None:
     render_header(ticker_input, info, price_history)
     st.divider()
 
-    render_price_chart(price_history)
+    render_price_chart(price_history, indicator_history)
     st.divider()
 
     render_key_stats(info)
